@@ -5,7 +5,9 @@ from typing import Any
 
 from config import LabConfig, load_config
 from memory_store import estimate_tokens
-from model_provider import build_chat_model
+from model_provider import LLMUnavailableError, build_chat_model, invoke_text
+
+SYSTEM_PROMPT = "Bạn là trợ lý hữu ích. Trả lời ngắn gọn bằng ngôn ngữ của người dùng."
 
 
 @dataclass
@@ -16,60 +18,52 @@ class SessionState:
 
 
 class BaselineAgent:
-    """Student TODO: implement Agent A.
+    """Agent A: within-session memory only.
 
-    Requirements:
-    - Within-session memory only
-    - No persistent `User.md`
-    - Should forget long-term facts across new threads
+    - Every turn sends the whole thread (system prompt + all earlier messages) to the LLM.
+    - No `User.md`, no compaction.
+    - A new `thread_id` starts empty, so long-term facts are forgotten by design.
+
+    The chat model comes from `llm` (any object with `.invoke(messages)`) or, when
+    `config.live` is set, from `build_chat_model(config.model)`.
     """
 
-    def __init__(self, config: LabConfig | None = None, force_offline: bool = False) -> None:
+    def __init__(self, config: LabConfig | None = None, llm: Any | None = None) -> None:
         self.config = config or load_config()
-        self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
+        self.llm = llm or self._maybe_build_llm()
 
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
-        self.langchain_agent = None
+    def _maybe_build_llm(self):
+        if not self.config.live:
+            raise LLMUnavailableError(
+                "No LLM configured. Set LLM_PROVIDER and its API key (see .env), or pass `llm=`."
+            )
+        return build_chat_model(self.config.model)
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
+        # `user_id` is deliberately unused: the baseline has no per-user memory.
+        session = self._session(thread_id)
+        session.messages.append({"role": "user", "content": message})
+        prompt = [{"role": "system", "content": SYSTEM_PROMPT}, *session.messages]
 
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
+        prompt_tokens = sum(estimate_tokens(m["content"]) for m in prompt)
+        reply = invoke_text(self.llm, prompt)
 
-        raise NotImplementedError
+        session.messages.append({"role": "assistant", "content": reply})
+        session.prompt_tokens_processed += prompt_tokens
+        agent_tokens = estimate_tokens(reply)
+        session.token_usage += agent_tokens
+        return {"reply": reply, "agent_tokens": agent_tokens, "prompt_tokens": prompt_tokens}
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        return self._session(thread_id).token_usage
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        return self._session(thread_id).prompt_tokens_processed
 
     def compaction_count(self, thread_id: str) -> int:
         # Baseline has no compact memory.
         return 0
 
-    def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
-
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
-        """
-
-        raise NotImplementedError
-
-    def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
-
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
-        """
-
-        raise NotImplementedError
+    def _session(self, thread_id: str) -> SessionState:
+        return self.sessions.setdefault(thread_id, SessionState())
